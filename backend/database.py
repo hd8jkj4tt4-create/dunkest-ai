@@ -1,0 +1,29 @@
+import sqlite3
+from backend.config import DB_PATH
+
+def connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    with connect() as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS players (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, team TEXT DEFAULT '',
+            role TEXT NOT NULL, price REAL NOT NULL, projection REAL NOT NULL DEFAULT 0,
+            avg_points REAL DEFAULT 0, last5 REAL DEFAULT 0, status TEXT DEFAULT 'unknown',
+            source TEXT DEFAULT 'manual', updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )''')
+        con.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        )''')
+        con.execute('''CREATE TABLE IF NOT EXISTS coaches (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, team TEXT DEFAULT '',
+            price REAL NOT NULL, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
+            win_pct REAL DEFAULT 0, ppg_for REAL DEFAULT 0, ppg_against REAL DEFAULT 0,
+            diff REAL DEFAULT 0, career_wins INTEGER DEFAULT 0, career_losses INTEGER DEFAULT 0,
+            opponent_coach TEXT DEFAULT '', record_match INTEGER,
+            projection REAL DEFAULT 0, source TEXT DEFAULT 'merged',
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )''')
