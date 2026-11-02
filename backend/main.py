@@ -66,6 +66,9 @@ app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
 @app.get("/")
 def home(): return FileResponse(FRONTEND / "index.html")
 
+@app.get("/favicon.ico")
+def favicon(): return FileResponse(FRONTEND / "favicon.svg", media_type="image/svg+xml")
+
 @app.get("/api/health")
 def health():
     return {
