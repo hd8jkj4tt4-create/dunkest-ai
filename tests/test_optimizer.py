@@ -13,6 +13,21 @@ def test_optimizer_respects_budget_roles_and_maximizes_spend_on_tie():
     assert out["projected_points"] == 100
     assert out["cost"] == 53
 
+def test_injured_players_are_excluded_from_team_picking():
+    ps=[]
+    for role,count in {"C":2,"F":4,"G":4}.items():
+        for i in range(count):
+            ps.append(dict(id=f"{role}{i}",name=f"{role}{i}",team=f"T{role}{i}",role=role,price=5,projection=8,status="active"))
+    # Injured/out players with huge scores must never be selected.
+    ps.append(dict(id="inj1",name="Injured Star",team="TX",role="G",price=30,projection=99,status="Out (injury)"))
+    ps.append(dict(id="inj2",name="Injured Star 2",team="TY",role="F",price=30,projection=99,status="INJURED"))
+    ps.append(dict(id="inj3",name="Suspended",team="TZ",role="C",price=30,projection=99,status="suspended"))
+    out=optimize(ps, rules={"budget":95})
+    ids={p["id"] for p in out["players"]}
+    assert not {"inj1","inj2","inj3"} & ids
+    assert out["players_considered"] == 10
+
+
 def test_uses_average_when_projection_missing():
     ps=[]
     for role,count in {"C":2,"F":4,"G":4}.items():
@@ -147,3 +162,45 @@ def test_coach_sources_are_merged_on_team_name():
     assert det["projection"] > 0
     # A coach whose team is missing from the results still keeps its price.
     assert rows[1]["price"] == 6.0
+
+
+def test_injury_report_flags_exclude_players_from_picking(tmp_path, monkeypatch):
+    import backend.database as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.db")
+    db.init_db()
+    from backend.routes.players import save, apply_injuries
+    ps = []
+    for role, count in {"C": 2, "F": 4, "G": 4}.items():
+        for i in range(count):
+            ps.append(dict(id=f"{role}{i}", name=f"{role}{i}", team=f"T{role}{i}", role=role,
+                           price=5, projection=8, avg_points=0, last5=0, status="unknown", source="csv"))
+    ps.append(dict(id="star", name="Star Player", team="BOS", role="G", price=10,
+                   projection=50, avg_points=0, last5=0, status="unknown", source="csv"))
+    save(ps)
+    matched = apply_injuries([
+        {"id": "999", "name": "Star Player", "team": "BOS", "status": "out",
+         "detail": "Indisponibile fino al 6 Nov"},
+    ])
+    assert matched == 1
+    with db.connect() as con:
+        row = con.execute("SELECT injured, status, status_detail FROM players WHERE id='star'").fetchone()
+    assert row["injured"] == 1 and row["status"] == "out"
+    assert "Indisponibile" in row["status_detail"]
+    with db.connect() as con:
+        db_players = [dict(r) for r in con.execute("SELECT * FROM players").fetchall()]
+    out = optimize(db_players, rules={"budget": 95})
+    ids = {p["id"] for p in out["players"]}
+    assert "star" not in ids
+    assert out["players_considered"] == 10
+    # A second sync without that injury clears the mark.
+    apply_injuries([])
+    with db.connect() as con:
+        row = con.execute("SELECT injured, status FROM players WHERE id='star'").fetchone()
+    assert row["injured"] == 0 and row["status"] == "unknown"
+
+
+def test_injury_status_mapping_distinguishes_out_from_gtd():
+    from backend.services.injury_collector import _status
+    assert _status({"reason": "Anca", "description": "Indisponibile fino al 6 Nov"}) == "out"
+    assert _status({"reason": "Riposo", "description": ""}) == "out"
+    assert _status({"reason": "Caviglia", "description": "GTD: da valutare prima della partita"}) == "injured"

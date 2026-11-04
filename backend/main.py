@@ -30,6 +30,11 @@ def _auto_refresh():
     def work_players():
         rows = fetch_live()
         players.save(rows, replace_sources=players.LIVE_SOURCES)
+        # Stats replace rows (and their injury flags), so re-apply injuries.
+        try:
+            players.sync_injuries()
+        except (ValueError, RuntimeError) as exc:
+            logger.warning("auto-refresh infortuni non riuscito: %s", exc)
         return rows
 
     def work_coaches():

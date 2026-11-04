@@ -13,8 +13,15 @@ def init_db():
             id TEXT PRIMARY KEY, name TEXT NOT NULL, team TEXT DEFAULT '',
             role TEXT NOT NULL, price REAL NOT NULL, projection REAL NOT NULL DEFAULT 0,
             avg_points REAL DEFAULT 0, last5 REAL DEFAULT 0, status TEXT DEFAULT 'unknown',
+            injured INTEGER DEFAULT 0, status_detail TEXT DEFAULT '',
             source TEXT DEFAULT 'manual', updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )''')
+        # Migrate databases created before the injury columns existed.
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(players)").fetchall()}
+        if "injured" not in cols:
+            con.execute("ALTER TABLE players ADD COLUMN injured INTEGER DEFAULT 0")
+        if "status_detail" not in cols:
+            con.execute("ALTER TABLE players ADD COLUMN status_detail TEXT DEFAULT ''")
         con.execute('''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         )''')

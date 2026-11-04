@@ -35,6 +35,20 @@ def _score(p):
         return avg, "average proxy"
     return 0.0, "no scoring data"
 
+# Statuses that make a player unavailable: injured/out players never enter the
+# team picking phase. Matching is case-insensitive and substring-based so
+# values like "Out (injury)", "injured", "ruled out" are all caught.
+UNAVAILABLE_TOKENS = (
+    "injur", "out", "ruled out", "inactive", "suspend",
+    "not available", "did not play", "dnp", "ir",
+)
+
+def _unavailable(status) -> bool:
+    s = str(status or "unknown").strip().lower()
+    if not s or s in {"unknown", "active", "available", "probable", "questionable", "day-to-day", "gtc"}:
+        return False
+    return any(t in s for t in UNAVAILABLE_TOKENS)
+
 def _eligible_coaches(coaches):
     eligible = []
     for c in coaches or []:
@@ -56,8 +70,8 @@ def optimize(players, coaches=None, rules=None):
     roles = rules["roles"]
     eligible = []
     for p in players:
-        status = str(p.get("status", "unknown")).strip().lower()
-        if status in {"out", "injured", "inactive", "ruled out", "suspended"}:
+        # Injured/out players never enter the team picking phase.
+        if p.get("injured") in (1, True, "1") or _unavailable(p.get("status")):
             continue
         price = _number(p.get("price"))
         role = str(p.get("role", "")).strip().upper()
