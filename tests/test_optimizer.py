@@ -13,6 +13,50 @@ def test_optimizer_respects_budget_roles_and_maximizes_spend_on_tie():
     assert out["projected_points"] == 100
     assert out["cost"] == 53
 
+
+def _stacked_setup(include_coach=True):
+    ps = []
+    for role, count in {"C": 2, "F": 4, "G": 4}.items():
+        for i in range(count):
+            ps.append(dict(id=f"{role}{i}", name=f"{role}{i}", team=f"T{role}{i}",
+                           role=role, price=5, projection=8, status="active"))
+    for i in range(6):
+        ps.append(dict(id=f"bos{i}", name=f"BOS{i}", team="BOS",
+                       role="C" if i < 2 else ("F" if i < 4 else "G"),
+                       price=5, projection=50, status="active"))
+    cs = [dict(id="bos-coach", name="Joe Mazzulla", team="Boston Celtics", price=1, projection=100),
+          dict(id="other-coach", name="Other", team="Other Team", price=1, projection=1)]
+    return ps, (cs if include_coach else [])
+
+
+def test_max_per_team_counts_the_coach_towards_the_limit():
+    ps, cs = _stacked_setup()
+    out = optimize(ps, coaches=cs, rules={"budget": 95, "include_coach": True})
+    bos_players = sum(1 for p in out["players"] if p["team"] == "BOS")
+    total = bos_players + (1 if out["coach"]["team"] == "Boston Celtics" else 0)
+    assert total <= 3
+    # The coach (100 pts) is worth more than a third stacked player, so the
+    # optimizer keeps him and stops at 2 players from the same franchise.
+    assert out["coach"]["id"] == "bos-coach"
+    assert bos_players == 2
+    assert out["projected_points"] == 8 * 8 + 2 * 50 + 100
+
+
+def test_max_per_team_without_coach_allows_three_players():
+    ps, _ = _stacked_setup(include_coach=False)
+    out = optimize(ps, coaches=[], rules={"budget": 95, "include_coach": False})
+    assert sum(1 for p in out["players"] if p["team"] == "BOS") == 3
+    assert out["projected_points"] == 7 * 8 + 3 * 50
+
+
+def test_team_key_normalizes_coach_full_name_and_alt_abbreviations():
+    from backend.services.team_optimizer import _team_key
+    assert _team_key("Boston Celtics") == "BOS"
+    assert _team_key("Detroit Pistons") == "DET"
+    assert _team_key("BOS") == "BOS"
+    assert _team_key("BRK") == "BKN"
+    assert _team_key("") == ""
+
 def test_injured_players_are_excluded_from_team_picking():
     ps=[]
     for role,count in {"C":2,"F":4,"G":4}.items():
@@ -142,6 +186,48 @@ def test_expected_coach_points_follows_dunkest_official_table():
     assert expected_coach_points(1.0, 125, 80) == 45
     # Average opponent: 50% win chance between +15 and -7.
     assert expected_coach_points(0.5, 110, 108) == 4
+
+
+def test_missing_ppg_data_never_earns_scoring_bonuses():
+    from backend.services.coach_collector import expected_coach_points
+    # 0 PPG must not read as "conceded <=95" (+5): record-derived margin is 0
+    # at win_pct 0.5, so only the +/-15/-7 table applies.
+    assert expected_coach_points(0.5, 0, 0) == 4.0
+    # Undefeated record without PPG: record-derived margin 20 -> win bucket +23.
+    assert expected_coach_points(1.0, 0, 0) == 23.0
+
+
+def test_ppg_bonus_boundaries_match_official_rules():
+    from backend.services.coach_collector import expected_coach_points
+    assert expected_coach_points(1.0, 95, 100) == 15 - 3    # scored <=95 -> -3
+    assert expected_coach_points(1.0, 110, 120) == 18 - 3   # conceded >=120 -> -3
+    assert expected_coach_points(1.0, 120, 110) == 18 + 5   # scored >=120 -> +5
+    assert expected_coach_points(1.0, 110, 95) == 20 + 5    # conceded <=95 -> +5
+
+
+def test_official_coefficient_table_and_expected_average():
+    from backend.services.coach_collector import pair_coefficient, expected_coefficient
+    assert pair_coefficient(20, 4) == 0.70    # >=16 credits apart, higher price
+    assert pair_coefficient(4, 20) == 1.60    # same gap, lower price
+    assert pair_coefficient(5, 4.5) == 1.00   # <1 credit apart
+    assert expected_coefficient(20, [4]) == (0.70, round(1 / 0.70, 4))
+    assert expected_coefficient(4, [20]) == (1.60, 0.625)
+
+
+def test_merge_applies_expected_coefficient_and_espn_name_aliases():
+    from backend.services.coach_collector import merge_sources, expected_coach_points
+    stats = {"wins": 5, "losses": 1, "win_pct": 0.8333,
+             "ppg_for": 110.0, "ppg_against": 105.0, "diff": 5.0}
+    listone = [{"name": "Rich", "team": "Los Angeles Clippers", "price": 20.0},
+               {"name": "Cheap", "team": "Y", "price": 4.0}]
+    # ESPN reports the franchise as "LA Clippers": the alias must still join.
+    espn = {"LA Clippers": dict(stats), "Y": dict(stats)}
+    rows = merge_sources(listone, espn, {})
+    raw = expected_coach_points(0.8333, 110, 105)
+    assert rows[0]["ppg_for"] == 110.0 and rows[1]["ppg_for"] == 110.0
+    assert rows[0]["projection"] < raw < rows[1]["projection"]
+    assert rows[0]["coefficient_win"] == 0.70
+    assert rows[1]["coefficient_win"] == 1.60
 
 
 def test_coach_sources_are_merged_on_team_name():

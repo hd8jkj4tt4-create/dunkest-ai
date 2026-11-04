@@ -22,7 +22,7 @@ La sincronizzazione valida il numero e i campi dei giocatori prima di salvare: s
 
 ## Budget e ottimizzazione
 
-Inserisci i crediti nel campo **Crediti disponibili** prima di generare la squadra. Il valore viene inviato all'API ad ogni calcolo. I vincoli di roster iniziali sono 10 giocatori: 2 C, 4 F e 4 G, massimo 3 per squadra; verifica che corrispondano al regolamento della modalità/giornata che stai usando.
+Inserisci i crediti nel campo **Crediti disponibili** prima di generare la squadra. Il valore viene inviato all'API ad ogni calcolo. I vincoli di roster iniziali sono 10 giocatori: 2 C, 4 F e 4 G, massimo 3 membri per squadra NBA **incluso l'allenatore**; verifica che corrispondano al regolamento della modalità/giornata che stai usando.
 
 Il motore massimizza il punteggio stimato e, a parità di punteggio, il budget utilizzato. Se la fonte non fornisce una proiezione, usa medie/forma disponibili come proxy: non è una previsione garantita.
 
@@ -35,7 +35,7 @@ In modalità Classica Dunkest si compone **10 giocatori + 1 allenatore con lo st
 - **Basketball-Reference**: incrocio del record e carriera dell'allenatore
 - **NBA.com** (API stats): confronto aggiuntivo, usato solo se raggiungibile (alcune reti lo bloccano; in tal caso le altre fonti restano attive)
 
-Il punteggio atteso dell'allenatore applica la tabella ufficiale Dunkest (vittoria/sconfitta con scarti, bonus/malus sui punti fatti e subiti); il coefficiente di difficoltà resta a 1 perché dipende dall'avversario della giornata. L'ottimizzatore sceglie **esattamente un allenatore**, conteggia i suoi crediti nel budget totale e lo somma al punteggio dei 10 giocatori. La casella **Allenatore** nella sezione team permette di disattivarlo e tornare al solo roster.
+Il punteggio atteso dell'allenatore applica la tabella ufficiale Dunkest (vittoria/sconfitta con scarti, bonus/malus sui punti fatti e subiti, solo se i dati PPG sono disponibili) e il **coefficiente di difficoltà avversario** (tabella ufficiale 0,70–1,60), stimato mediando sui prezzi di tutti gli allenatori del listone perché l'avversario della giornata non è ancora noto. L'ottimizzatore sceglie **esattamente un allenatore**, conteggia i suoi crediti nel budget totale, lo somma al punteggio dei 10 giocatori e lo include nel limite di **3 membri per squadra**. La casella **Allenatore** nella sezione team permette di disattivarlo e tornare al solo roster.
 
 ## CSV
 

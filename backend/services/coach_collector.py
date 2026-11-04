@@ -53,6 +53,50 @@ WIN_BUCKETS = [(5, 15), (10, 18), (15, 20), (20, 23), (25, 25),
 LOSS_BUCKETS = [(5, -7), (10, -10), (15, -13), (20, -15), (25, -18),
                 (30, -20), (35, -23), (40, -25), (float("inf"), -30)]
 
+# Official Dunkest coefficient table: (min_abs_diff, higher_price, lower_price).
+COEFF_TABLE = [(16.0, 0.70, 1.60), (12.0, 0.75, 1.50), (8.0, 0.79, 1.41),
+               (6.0, 0.83, 1.32), (4.0, 0.87, 1.23), (2.0, 0.91, 1.14),
+               (1.0, 0.95, 1.05), (0.0, 1.00, 1.00)]
+
+# Sources disagree on a few display names (ESPN vs Dunkest listone).
+TEAM_NAME_ALIASES = {"LA Clippers": "Los Angeles Clippers"}
+
+
+def normalize_team_name(name):
+    s = str(name or "").strip()
+    return TEAM_NAME_ALIASES.get(s, s)
+
+
+def pair_coefficient(price_self, price_other):
+    """Official coefficient applied to one coach's score against another."""
+    price_self, price_other = _float(price_self), _float(price_other)
+    diff = abs(price_self - price_other)
+    for minimum, higher, lower in COEFF_TABLE:
+        if diff >= minimum:
+            return higher if price_self >= price_other else lower
+    return 1.00
+
+
+def expected_coefficient(price, other_prices):
+    """Average (win, loss) coefficients for a coach over the listone prices.
+
+    The real coefficient needs the matchday opponent, which is unknown before
+    the round: averaging it over every other coach's price is the closest
+    unbiased estimate. Wins multiply by the table value, losses divide by it,
+    so the two expected multipliers differ.
+    """
+    price = _float(price)
+    others = [_float(p) for p in other_prices if _float(p) > 0]
+    if not others:
+        return 1.0, 1.0
+    wins = []
+    losses = []
+    for other in others:
+        value = pair_coefficient(price, other)
+        wins.append(value)
+        losses.append(1.0 / value)
+    return round(sum(wins) / len(wins), 4), round(sum(losses) / len(losses), 4)
+
 
 def _http_get(url, timeout=(10, 40), headers=None):
     merged = {"User-Agent": USER_AGENT, "Accept": "*/*"}
@@ -94,24 +138,36 @@ def _margin_bucket(margin, buckets):
     return buckets[-1][1]
 
 
-def expected_coach_points(win_pct, ppg_for, ppg_against, coefficient=1.0):
+def expected_coach_points(win_pct, ppg_for, ppg_against, coefficient=1.0, loss_coefficient=None):
     """Expected Dunkest coach points per game from a team's season averages."""
+    if loss_coefficient is None:
+        loss_coefficient = coefficient
     win_pct = max(0.0, min(1.0, _float(win_pct)))
     ppg_for = _float(ppg_for)
     ppg_against = _float(ppg_against)
-    margin = abs(ppg_for - ppg_against)
-    base = win_pct * _margin_bucket(margin, WIN_BUCKETS) + \
-        (1.0 - win_pct) * _margin_bucket(margin, LOSS_BUCKETS)
+    has_ppg = ppg_for > 0 and ppg_against > 0
+    if has_ppg:
+        margin = abs(ppg_for - ppg_against)
+    else:
+        # No scoring data: estimate the margin from the record alone instead
+        # of treating the missing 0 PPG as a real (and rewarding) value.
+        margin = abs(20.0 * (2 * win_pct - 1))
+    win_part = win_pct * _margin_bucket(margin, WIN_BUCKETS)
+    loss_part = (1.0 - win_pct) * _margin_bucket(margin, LOSS_BUCKETS)
     bonus = 0.0
-    if ppg_for >= 120:
-        bonus += 5
-    elif ppg_for < 95:
-        bonus -= 3
-    if ppg_against <= 95:
-        bonus += 5
-    elif ppg_against > 120:
-        bonus -= 3
-    score = (base + bonus) * coefficient
+    if has_ppg:
+        # Official rules: >=120 scored +5, <=95 scored -3,
+        # <=95 conceded +5, >=120 conceded -3.
+        if ppg_for >= 120:
+            bonus += 5
+        elif ppg_for <= 95:
+            bonus -= 3
+        if ppg_against <= 95:
+            bonus += 5
+        elif ppg_against >= 120:
+            bonus -= 3
+    score = win_part * coefficient + loss_part * loss_coefficient + \
+        bonus * (win_pct * coefficient + (1.0 - win_pct) * loss_coefficient)
     return round(score, 2)
 
 
@@ -140,7 +196,7 @@ def fetch_espn_records():
     for conference in data.get("children", []):
         for entry in conference.get("standings", {}).get("entries", []):
             team = entry.get("team", {})
-            name = str(team.get("displayName", "")).strip()
+            name = normalize_team_name(team.get("displayName", ""))
             stats = {s.get("name"): s.get("value") for s in entry.get("stats", [])}
             wins = _int(stats.get("wins"))
             losses = _int(stats.get("losses"))
@@ -223,8 +279,10 @@ def fetch_nba_records():
 def merge_sources(listone, espn, bbref, nba=None):
     """Join every source on the team name; price comes from Dunkest."""
     nba = nba or {}
+    espn = {normalize_team_name(k): v for k, v in espn.items()}
+    all_prices = [coach["price"] for coach in listone]
     rows = []
-    for coach in listone:
+    for idx, coach in enumerate(listone):
         team = coach["team"]
         record = espn.get(team, {})
         cross = bbref.get(team, {})
@@ -246,6 +304,8 @@ def merge_sources(listone, espn, bbref, nba=None):
             sources.append("basketball_reference")
         if nba_rec:
             sources.append("nba.com")
+        m_win, m_loss = expected_coefficient(
+            coach["price"], all_prices[:idx] + all_prices[idx + 1:])
         rows.append({
             "id": re.sub(r"[^a-z0-9]+", "-", f"{coach['name']}-{team}".lower()).strip("-"),
             "name": coach["name"], "team": team, "price": coach["price"],
@@ -256,7 +316,10 @@ def merge_sources(listone, espn, bbref, nba=None):
             "career_losses": cross.get("career_losses", 0),
             "opponent_coach": cross.get("coach", ""),
             "record_match": record_match,
-            "projection": expected_coach_points(win_pct, ppg_for, ppg_against),
+            "projection": expected_coach_points(
+                win_pct, ppg_for, ppg_against, m_win, m_loss),
+            "coefficient_win": m_win,
+            "coefficient_loss": m_loss,
             "source": "+".join(sources),
         })
     return rows

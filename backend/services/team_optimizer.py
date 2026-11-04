@@ -13,6 +13,28 @@ DEFAULT_RULES = {
     "time_limit_ms": 20000,
 }
 
+# Players use 3-letter codes (BOS) while coaches carry the full name
+# (Boston Celtics): both must map to one key so the per-team limit counts
+# the coach among the same franchise's members.
+TEAM_ALIASES = {
+    "ATLANTA HAWKS": "ATL", "BOSTON CELTICS": "BOS", "BROOKLYN NETS": "BKN",
+    "CHARLOTTE HORNETS": "CHA", "CHICAGO BULLS": "CHI", "CLEVELAND CAVALIERS": "CLE",
+    "DALLAS MAVERICKS": "DAL", "DENVER NUGGETS": "DEN", "DETROIT PISTONS": "DET",
+    "GOLDEN STATE WARRIORS": "GSW", "HOUSTON ROCKETS": "HOU", "INDIANA PACERS": "IND",
+    "LOS ANGELES CLIPPERS": "LAC", "LOS ANGELES LAKERS": "LAL", "MEMPHIS GRIZZLIES": "MEM",
+    "MIAMI HEAT": "MIA", "MILWAUKEE BUCKS": "MIL", "MINNESOTA TIMBERWOLVES": "MIN",
+    "NEW ORLEANS PELICANS": "NOP", "NEW YORK KNICKS": "NYK", "OKLAHOMA CITY THUNDER": "OKC",
+    "ORLANDO MAGIC": "ORL", "PHILADELPHIA 76ERS": "PHI", "PHOENIX SUNS": "PHX",
+    "PORTLAND TRAIL BLAZERS": "POR", "SACRAMENTO KINGS": "SAC", "SAN ANTONIO SPURS": "SAS",
+    "TORONTO RAPTORS": "TOR", "UTAH JAZZ": "UTA", "WASHINGTON WIZARDS": "WAS",
+    # Alternate abbreviations used by other sources.
+    "BRK": "BKN", "CHO": "CHA", "PHO": "PHX", "NO": "NOP", "GS": "GSW",
+}
+
+def _team_key(value):
+    s = str(value or "").strip().upper()
+    return TEAM_ALIASES.get(s, s)
+
 def _number(value):
     try:
         n = float(value or 0)
@@ -100,12 +122,18 @@ def optimize(players, coaches=None, rules=None):
     solver.Add(solver.Sum(x[str(p["id"])] for p in eligible) == int(rules["roster_size"]))
     for role, count in roles.items():
         solver.Add(solver.Sum(x[str(p["id"])] for p in eligible if str(p["role"]).upper() == role) == int(count))
-    for team in {str(p.get("team", "")).strip() for p in eligible} - {""}:
-        solver.Add(solver.Sum(x[str(p["id"])] for p in eligible if str(p.get("team", "")).strip() == team) <= int(rules["max_per_team"]))
-
     y = {str(c["id"]): solver.BoolVar(f"y_{i}") for i, c in enumerate(coach_pool)}
     if coach_pool:
         solver.Add(solver.Sum(y[str(c["id"])] for c in coach_pool) == 1)
+
+    # Max members per NBA franchise, coach included (e.g. 3 total: players + coach).
+    player_team = {str(p["id"]): _team_key(p.get("team")) for p in eligible}
+    coach_team = {str(c["id"]): _team_key(c.get("team")) for c in coach_pool}
+    for team in (set(player_team.values()) | set(coach_team.values())) - {""}:
+        members = [x[pid] for pid, t in player_team.items() if t == team]
+        members += [y[cid] for cid, t in coach_team.items() if t == team]
+        if members:
+            solver.Add(solver.Sum(members) <= int(rules["max_per_team"]))
 
     player_cost = solver.Sum(x[str(p["id"])] * p["_price"] for p in eligible)
     coach_cost = solver.Sum(y[str(c["id"])] * c["_price"] for c in coach_pool)
@@ -151,7 +179,7 @@ def optimize(players, coaches=None, rules=None):
         "player_points": round(player_score, 2),
         "coach_points": round(coach_score, 2),
         "score_basis": bases,
-        "coach_basis": "Punti attesi allenatore da regolamento Dunkest (vittoria/sconfitta + margini + bonus PPG, coefficiente avversario = 1)." if chosen_coach else None,
+        "coach_basis": "Punti attesi allenatore da regolamento Dunkest (vittoria/sconfitta + margini + bonus PPG); coefficiente avversario atteso mediando sui prezzi del listone." if chosen_coach else None,
         "status": "OPTIMAL" if status == pywraplp.Solver.OPTIMAL else "FEASIBLE",
         "players_considered": len(eligible),
         "coaches_considered": len(coach_pool),
