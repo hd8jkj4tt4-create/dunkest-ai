@@ -9,13 +9,14 @@ DEFAULT_RULES = {
     "budget": 95.0,
     "roster_size": 10,
     "roles": {"C": 2, "F": 4, "G": 4},
-    "max_per_team": 3,
+    "max_per_team": 2,
     "time_limit_ms": 20000,
 }
 
 # Players use 3-letter codes (BOS) while coaches carry the full name
-# (Boston Celtics): both must map to one key so the per-team limit counts
-# the coach among the same franchise's members.
+# (Boston Celtics): both must map to one key so the optimizer recognises the
+# franchise. The per-team limit applies to the 10 players only; the coach is
+# excluded (2 players + 1 coach from the same team is allowed).
 TEAM_ALIASES = {
     "ATLANTA HAWKS": "ATL", "BOSTON CELTICS": "BOS", "BROOKLYN NETS": "BKN",
     "CHARLOTTE HORNETS": "CHA", "CHICAGO BULLS": "CHI", "CLEVELAND CAVALIERS": "CLE",
@@ -126,12 +127,11 @@ def optimize(players, coaches=None, rules=None):
     if coach_pool:
         solver.Add(solver.Sum(y[str(c["id"])] for c in coach_pool) == 1)
 
-    # Max members per NBA franchise, coach included (e.g. 3 total: players + coach).
+    # Max players per NBA franchise. The coach does NOT count towards this
+    # limit: 2 players + the coach of the same team is a valid combination.
     player_team = {str(p["id"]): _team_key(p.get("team")) for p in eligible}
-    coach_team = {str(c["id"]): _team_key(c.get("team")) for c in coach_pool}
-    for team in (set(player_team.values()) | set(coach_team.values())) - {""}:
+    for team in set(player_team.values()) - {""}:
         members = [x[pid] for pid, t in player_team.items() if t == team]
-        members += [y[cid] for cid, t in coach_team.items() if t == team]
         if members:
             solver.Add(solver.Sum(members) <= int(rules["max_per_team"]))
 
@@ -179,7 +179,7 @@ def optimize(players, coaches=None, rules=None):
         "player_points": round(player_score, 2),
         "coach_points": round(coach_score, 2),
         "score_basis": bases,
-        "coach_basis": "Punti attesi allenatore da regolamento Dunkest (vittoria/sconfitta + margini + bonus PPG); coefficiente avversario atteso mediando sui prezzi del listone." if chosen_coach else None,
+        "coach_basis": "Punti attesi allenatore: media live Dunkest (60%) + modello regolamentare (40%), con coefficiente avversario calcolato sulla quotazione reale dell'allenatore avversario." if chosen_coach else None,
         "status": "OPTIMAL" if status == pywraplp.Solver.OPTIMAL else "FEASIBLE",
         "players_considered": len(eligible),
         "coaches_considered": len(coach_pool),

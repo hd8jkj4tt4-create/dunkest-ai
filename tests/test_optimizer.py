@@ -7,7 +7,7 @@ def test_optimizer_respects_budget_roles_and_maximizes_spend_on_tie():
     for i in range(4): ps.append(dict(id=f"g{i}",name=f"G{i}",team=f"V{i}",role="G",price=5,projection=10,status="active"))
     # Add an equal-score expensive alternative; tie-break should use more credits.
     ps[0]["price"] = 8
-    out=optimize(ps, rules={"budget":95,"roster_size":10,"roles":{"C":2,"F":4,"G":4},"max_per_team":3})
+    out=optimize(ps, rules={"budget":95,"roster_size":10,"roles":{"C":2,"F":4,"G":4},"max_per_team":2})
     assert len(out["players"]) == 10
     assert out["cost"] <= 95
     assert out["projected_points"] == 100
@@ -29,24 +29,23 @@ def _stacked_setup(include_coach=True):
     return ps, (cs if include_coach else [])
 
 
-def test_max_per_team_counts_the_coach_towards_the_limit():
+def test_max_two_players_per_team_and_coach_is_excluded_from_the_limit():
     ps, cs = _stacked_setup()
     out = optimize(ps, coaches=cs, rules={"budget": 95, "include_coach": True})
     bos_players = sum(1 for p in out["players"] if p["team"] == "BOS")
-    total = bos_players + (1 if out["coach"]["team"] == "Boston Celtics" else 0)
-    assert total <= 3
-    # The coach (100 pts) is worth more than a third stacked player, so the
-    # optimizer keeps him and stops at 2 players from the same franchise.
-    assert out["coach"]["id"] == "bos-coach"
+    # The 10-player limit is 2 per franchise; the coach does not count, so
+    # 2 Boston players + the Boston coach (3 franchise members) is valid.
     assert bos_players == 2
+    assert out["coach"]["id"] == "bos-coach"
     assert out["projected_points"] == 8 * 8 + 2 * 50 + 100
 
 
-def test_max_per_team_without_coach_allows_three_players():
+def test_max_two_players_per_team_without_coach():
     ps, _ = _stacked_setup(include_coach=False)
     out = optimize(ps, coaches=[], rules={"budget": 95, "include_coach": False})
-    assert sum(1 for p in out["players"] if p["team"] == "BOS") == 3
-    assert out["projected_points"] == 7 * 8 + 3 * 50
+    # A third Boston player must not enter the roster even without a coach.
+    assert sum(1 for p in out["players"] if p["team"] == "BOS") == 2
+    assert out["projected_points"] == 8 * 8 + 2 * 50
 
 
 def test_team_key_normalizes_coach_full_name_and_alt_abbreviations():
@@ -248,6 +247,38 @@ def test_coach_sources_are_merged_on_team_name():
     assert det["projection"] > 0
     # A coach whose team is missing from the results still keeps its price.
     assert rows[1]["price"] == 6.0
+
+
+def test_live_coach_projection_blends_live_and_model():
+    from backend.services.coach_collector import blend_live_projection
+    assert blend_live_projection(10, 5) == 8          # 60% live + 40% model
+    assert blend_live_projection(0, 5) == 5           # no live history -> model
+    assert blend_live_projection(-4, 0, has_history=True) == -4
+    assert blend_live_projection(0, 0) == 0
+
+
+def test_live_coach_columns_and_ids_are_persisted(tmp_path, monkeypatch):
+    import backend.database as db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "coaches.db")
+    db.init_db()
+    from backend.routes.coaches import save
+    save([{
+        "id": "steve-kerr-golden-state-warriors", "name": "Steve Kerr",
+        "team": "Golden State Warriors", "price": 7.1, "wins": 5, "losses": 3,
+        "projection": 8.34, "source": "dunkest_live", "dunkest_id": 80,
+        "matchday": 6, "opponent": "Miami Heat", "opponent_price": 7.9,
+        "live_avg": 9.4, "last5": 9.4, "model_projection": 6.75,
+        "coefficient_win": 1.0, "coefficient_loss": 1.0, "is_injured": 0,
+    }])
+    with db.connect() as con:
+        row = con.execute("SELECT dunkest_id,matchday,opponent,live_avg FROM coaches").fetchone()
+    assert row["dunkest_id"] == 80
+    assert row["matchday"] == 6
+    assert row["opponent"] == "Miami Heat"
+    assert row["live_avg"] == 9.4
+    from backend.services.coach_collector import _persisted_coach_refs
+    refs = _persisted_coach_refs()
+    assert refs and refs[0]["dunkest_id"] == 80
 
 
 def test_injury_report_flags_exclude_players_from_picking(tmp_path, monkeypatch):

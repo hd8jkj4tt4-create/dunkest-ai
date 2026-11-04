@@ -1,22 +1,46 @@
-"""Collect head coaches from several public sources and score them.
+"""Collect head coaches from the live Dunkest API and public sources.
 
-Sources (compared and merged):
-- Dunkest listone (official Google Sheet published by Dunkest) -> credits price
-- ESPN standings API                          -> W-L, PPG for/against
-- Basketball-Reference coaches page           -> W-L cross-check, career record
-- NBA.com stats API (stats.nba.com)           -> optional cross-check, may be
-  unreachable from some networks and is skipped gracefully when so.
+Sources:
+- Dunkest live API (fantaking-api.dunkest.com): current coach roster, price,
+  matchday, opponent and actual fantasy points. The token is only required to
+  discover coach IDs; profile/match-log endpoints are public.
+- Dunkest listone (official Google Sheet): fallback price/name/team when the
+  live API is unavailable or the token has expired.
+- ESPN standings API: W-L, PPG for/against for the model.
+- Basketball-Reference coaches page: W-L cross-check, career record.
+- NBA.com stats API: optional cross-check, skipped gracefully when blocked.
 
 Coach scoring follows the official Dunkest coach rules (docs.dunkest.com):
-result + margin bonuses/penalties + points-for/against bonuses, with the
-opponent-difficulty coefficient left at 1.0 (unknown before the matchday).
+result + margin bonuses/penalties + points-for/against bonuses. The opponent
+coefficient uses the real opponent coach price for the current matchday; if
+the opponent is unknown it falls back to the average over all coach prices.
+The live projection blends actual Dunkest scoring (60%) with the model (40%).
 """
 import csv
 import io
+import json
+import logging
 import os
 import re
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+
+from backend.config import (
+    DUNKEST_EMAIL,
+    DUNKEST_GAME_ID,
+    DUNKEST_PASSWORD,
+    DUNKEST_TOKEN,
+)
+
+logger = logging.getLogger(__name__)
+
+DUNKEST_API_BASE = "https://fantaking-api.dunkest.com/api/v1"
+DUNKEST_LEAGUE_ID = int(os.getenv("DUNKEST_LEAGUE_ID", "1"))
+DUNKEST_PLAYERS_LIST_ID = int(os.getenv("DUNKEST_PLAYERS_LIST_ID", "1"))
+LIVE_WEIGHT = 0.6
+MODEL_WEIGHT = 0.4
 
 DUNKEST_LISTONE_URL = (
     "https://docs.google.com/spreadsheets/d/"
@@ -116,6 +140,396 @@ def _float(value):
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+_token_cache = {"value": DUNKEST_TOKEN}
+
+
+def _token_from_payload(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("token", "access_token", "accessToken"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("token", "access_token", "accessToken"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _login_token():
+    """Log in with optional DUNKEST_EMAIL/DUNKEST_PASSWORD credentials."""
+    if not DUNKEST_EMAIL or not DUNKEST_PASSWORD:
+        return ""
+    try:
+        game_id = int(DUNKEST_GAME_ID)
+    except (TypeError, ValueError):
+        game_id = 1
+    body = json.dumps({
+        "email": DUNKEST_EMAIL,
+        "password": DUNKEST_PASSWORD,
+        "game_id": game_id,
+    }).encode()
+    request = Request(
+        f"{DUNKEST_API_BASE}/login", data=body, method="POST",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=40) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (HTTPError, URLError, OSError, ValueError):
+        return ""
+    return _token_from_payload(payload)
+
+
+def _current_token(force_login=False):
+    if force_login or not _token_cache["value"]:
+        token = _login_token()
+        if token:
+            _token_cache["value"] = token
+    return _token_cache["value"]
+
+
+def _api_get(path, token=None, timeout=40):
+    url = path if path.startswith("http") else f"{DUNKEST_API_BASE}{path}"
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _ref_from_list_row(row):
+    team = row.get("team") or {}
+    return {
+        "dunkest_id": int(row["id"]),
+        "name": f"{row.get('first_name', '')} {row.get('last_name', '')}".strip(),
+        "team": team.get("name") or "",
+        "team_abbr": team.get("abbreviation") or "",
+        "list_price": _float(row.get("quotation")),
+        "is_injured": bool(row.get("is_injured")),
+    }
+
+
+def _coach_refs_from_list(matchday, token):
+    """Head coaches of one matchday from the authenticated players list."""
+    data = _api_get(
+        f"/players-lists/{DUNKEST_PLAYERS_LIST_ID}/matchdays/{matchday}/players"
+        "?per_page=1000&page=1",
+        token,
+    )
+    rows = data.get("data") if isinstance(data, dict) else data
+    refs = []
+    for row in rows or []:
+        if (row.get("position") or {}).get("id") != 4:
+            continue
+        ref = _ref_from_list_row(row)
+        if ref["dunkest_id"] and ref["name"] and ref["team"]:
+            refs.append(ref)
+    return refs
+
+
+def _discover_coach_refs():
+    """Discover coach IDs with the token, retrying once after a fresh login."""
+    token = _current_token()
+    if not token:
+        return []
+    for attempt in range(2):
+        try:
+            for matchday in range(1, 21):
+                try:
+                    refs = _coach_refs_from_list(matchday, token)
+                except HTTPError as exc:
+                    if exc.code in (401, 403):
+                        raise
+                    continue
+                if len(refs) >= 20:
+                    return refs
+            return []
+        except HTTPError as exc:
+            if exc.code not in (401, 403) or attempt:
+                return []
+            token = _current_token(force_login=True)
+            if not token:
+                return []
+    return []
+
+
+def _persisted_coach_refs():
+    """Coach IDs saved by a previous sync: allow live updates without a token."""
+    try:
+        from backend.database import connect
+        with connect() as con:
+            rows = con.execute(
+                "SELECT dunkest_id,name,team FROM coaches "
+                "WHERE dunkest_id IS NOT NULL AND dunkest_id > 0"
+            ).fetchall()
+    except Exception:
+        return []
+    return [{
+        "dunkest_id": int(row["dunkest_id"]),
+        "name": row["name"] or "",
+        "team": row["team"] or "",
+        "team_abbr": "",
+        "list_price": 0.0,
+        "is_injured": False,
+    } for row in rows]
+
+
+def _coach_log(coach_id):
+    data = _api_get(
+        f"/basketball/leagues/{DUNKEST_LEAGUE_ID}/players/{coach_id}/match-log"
+    )
+    if isinstance(data, dict):
+        return data.get("data") or []
+    return data or []
+
+
+def _fetch_logs(refs):
+    def work(ref):
+        coach_id = ref["dunkest_id"]
+        try:
+            return coach_id, _coach_log(coach_id)
+        except Exception:
+            return coach_id, []
+
+    logs = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for coach_id, log in pool.map(work, refs):
+            if log:
+                logs[coach_id] = log
+    return logs
+
+
+def _mean(values):
+    values = [value for value in values if value is not None]
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
+def _current_matchday(logs):
+    counts = Counter()
+    for log in logs.values():
+        for row in log:
+            number = row.get("matchday_number")
+            if number:
+                counts[number] += 1
+                break
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _row_for_matchday(log, matchday):
+    for row in log:
+        if row.get("matchday_number") == matchday:
+            return row
+    return None
+
+
+def blend_live_projection(live_avg, model_projection, has_history=False):
+    """Blend actual Dunkest points (60%) with the regulation model (40%)."""
+    live_avg = _float(live_avg)
+    model_projection = _float(model_projection)
+    has_live = bool(has_history) or live_avg != 0
+    if has_live and model_projection != 0:
+        return round(LIVE_WEIGHT * live_avg + MODEL_WEIGHT * model_projection, 2)
+    if has_live:
+        return round(live_avg, 2)
+    return round(model_projection, 2)
+
+
+def _sheet_price_index(listone):
+    by_name, by_team = {}, {}
+    for coach in listone or []:
+        price = _float(coach.get("price"))
+        if price <= 0:
+            continue
+        name = str(coach.get("name", "")).strip().lower()
+        team = normalize_team_name(coach.get("team")).lower()
+        if name:
+            by_name[name] = price
+        if team:
+            by_team[team] = price
+    return {"name": by_name, "team": by_team}
+
+
+def _sheet_price(ref, index):
+    price = index["name"].get(str(ref.get("name", "")).strip().lower())
+    if price:
+        return _float(price)
+    return _float(index["team"].get(normalize_team_name(ref.get("team")).lower()))
+
+
+def fetch_dunkest_live_coaches(espn=None, bbref=None, nba=None, listone=None):
+    """Build coach rows from the live Dunkest API.
+
+    The authenticated list is only used to discover coach IDs. All the data
+    used here (match log: opponent, price, fantasy points) is public, so the
+    sync keeps working without a token after the first successful run.
+    """
+    espn, bbref, nba = espn or {}, bbref or {}, nba or {}
+    refs = _discover_coach_refs()
+    if len(refs) < 20:
+        refs = _persisted_coach_refs()
+    if len(refs) < 20:
+        raise ValueError(
+            "token Dunkest assente/scaduto e nessun ID allenatore salvato: "
+            "imposta DUNKEST_TOKEN o DUNKEST_EMAIL/DUNKEST_PASSWORD."
+        )
+
+    logs = _fetch_logs(refs)
+    if len(logs) < 20:
+        raise ValueError(f"match-log Dunkest non disponibile per abbastanza allenatori ({len(logs)}).")
+    current_matchday = _current_matchday(logs)
+    if not current_matchday:
+        raise ValueError("matchday corrente Dunkest non rilevato dal match-log.")
+
+    # With a working token, refresh the current roster from the official list
+    # so mid-season coach changes are picked up automatically.
+    token = _current_token()
+    if token:
+        try:
+            current_refs = _coach_refs_from_list(current_matchday, token)
+            if len(current_refs) >= 20:
+                missing = [ref for ref in current_refs if ref["dunkest_id"] not in logs]
+                if missing:
+                    logs.update(_fetch_logs(missing))
+                refs = current_refs
+        except Exception:
+            pass
+
+    sheet_prices = _sheet_price_index(listone)
+    prices, price_source, current_rows = {}, {}, {}
+    for ref in refs:
+        coach_id = ref["dunkest_id"]
+        log = logs.get(coach_id, [])
+        row = _row_for_matchday(log, current_matchday)
+        current_rows[coach_id] = row
+        price = _float(row.get("quotation")) if row else 0.0
+        source = "dunkest_live"
+        if price <= 0:
+            price = _float(ref.get("list_price"))
+        if price <= 0:
+            price = _sheet_price(ref, sheet_prices)
+            source = "dunkest_listone"
+        if price > 0:
+            prices[coach_id] = price
+            price_source[coach_id] = source
+
+    prices_by_team = {}
+    coach_by_team = {}
+    for ref in refs:
+        team = normalize_team_name(ref.get("team"))
+        if team:
+            coach_by_team[team] = ref.get("name", "")
+            if prices.get(ref["dunkest_id"]):
+                prices_by_team[team] = prices[ref["dunkest_id"]]
+
+    all_prices = [prices[ref["dunkest_id"]] for ref in refs if ref["dunkest_id"] in prices]
+    rows = []
+    for index, ref in enumerate(refs):
+        coach_id = ref["dunkest_id"]
+        price = prices.get(coach_id, 0.0)
+        if price <= 0:
+            continue
+        log = logs.get(coach_id, [])
+        row = current_rows.get(coach_id) or {}
+        team = ref.get("team") or ""
+        record = espn.get(normalize_team_name(team), {})
+        cross = bbref.get(team, {})
+        nba_rec = nba.get(team, {})
+
+        wins = int(record.get("wins", 0))
+        losses = int(record.get("losses", 0))
+        ppg_for = _float(record.get("ppg_for"))
+        ppg_against = _float(record.get("ppg_against"))
+        if record:
+            win_pct = _float(record.get("win_pct"))
+            if not win_pct and wins + losses:
+                win_pct = round(wins / (wins + losses), 4)
+        elif cross:
+            wins, losses = int(cross.get("wins", 0)), int(cross.get("losses", 0))
+            win_pct = round(wins / (wins + losses), 4) if wins + losses else 0.0
+        elif nba_rec:
+            wins, losses = int(nba_rec.get("wins", 0)), int(nba_rec.get("losses", 0))
+            win_pct = round(wins / (wins + losses), 4) if wins + losses else 0.0
+            ppg_for = _float(nba_rec.get("ppg_for"))
+        else:
+            win_pct = 0.0
+
+        record_match = None
+        if record and cross:
+            record_match = (wins == cross.get("wins") and losses == cross.get("losses"))
+
+        opponent = (row.get("opponent_team") or {})
+        opponent_name = opponent.get("name") or ""
+        opponent_price = prices_by_team.get(normalize_team_name(opponent_name), 0.0)
+        if opponent_price > 0:
+            coefficient = pair_coefficient(price, opponent_price)
+            loss_coefficient = round(1.0 / coefficient, 4) if coefficient else 1.0
+        else:
+            others = all_prices[:index] + all_prices[index + 1:]
+            coefficient, loss_coefficient = expected_coefficient(price, others)
+
+        model_projection = 0.0
+        if record or cross or nba_rec:
+            model_projection = expected_coach_points(
+                win_pct, ppg_for, ppg_against, coefficient, loss_coefficient)
+
+        past = [
+            entry for entry in log
+            if entry.get("matchday_number") is not None
+            and entry.get("matchday_number") < current_matchday
+            and entry.get("fantasy_pts") is not None
+        ]
+        past.sort(key=lambda entry: entry["matchday_number"], reverse=True)
+        live_avg = _mean([entry["fantasy_pts"] for entry in past])
+        last5 = _mean([entry["fantasy_pts"] for entry in past[:5]])
+
+        sources = [price_source.get(coach_id, "dunkest_live")]
+        if record:
+            sources.append("espn")
+        if cross:
+            sources.append("basketball_reference")
+        if nba_rec:
+            sources.append("nba.com")
+
+        rows.append({
+            "id": re.sub(r"[^a-z0-9]+", "-", f"{ref.get('name', '')}-{team}".lower()).strip("-"),
+            "name": ref.get("name", ""),
+            "team": team,
+            "price": price,
+            "wins": wins,
+            "losses": losses,
+            "win_pct": win_pct,
+            "ppg_for": round(ppg_for, 2),
+            "ppg_against": round(ppg_against, 2),
+            "diff": _float(record.get("diff")),
+            "career_wins": int(cross.get("career_wins", 0)),
+            "career_losses": int(cross.get("career_losses", 0)),
+            "opponent_coach": coach_by_team.get(normalize_team_name(opponent_name), ""),
+            "record_match": record_match,
+            "projection": blend_live_projection(live_avg, model_projection, bool(past)),
+            "coefficient_win": coefficient,
+            "coefficient_loss": loss_coefficient,
+            "source": "+".join(sources),
+            "dunkest_id": coach_id,
+            "matchday": current_matchday,
+            "opponent": opponent_name,
+            "opponent_price": opponent_price,
+            "live_avg": live_avg,
+            "last5": last5,
+            "model_projection": round(model_projection, 2),
+            "is_injured": int(bool(ref.get("is_injured"))),
+        })
+    return [row for row in rows if row["price"] > 0]
 
 
 def _int(value):
@@ -325,29 +739,15 @@ def merge_sources(listone, espn, bbref, nba=None):
     return rows
 
 
-def fetch_coaches():
-    """Fetch every source, compare them and return validated coach rows."""
-    listone = fetch_dunkest_listone()
-    if len(listone) < 20:
-        raise ValueError(f"Listone Dunkest non valido: {len(listone)} allenatori trovati.")
+def _safe_fetch(func, default):
     try:
-        espn = fetch_espn_records()
-    except Exception:
-        espn = {}
-    try:
-        bbref = fetch_bballref_records()
-    except Exception:
-        bbref = {}
-    nba = fetch_nba_records()
-    rows = merge_sources(listone, espn, bbref, nba)
-    rows = [r for r in rows if r["price"] > 0]
-    if len(rows) < 20:
-        raise ValueError(f"Fonti incomplete: {len(rows)} allenatori validi.")
-    if not espn and not bbref and not nba:
-        raise ValueError(
-            "Nessuna fonte di risultati raggiungibile (ESPN, Basketball-Reference, NBA.com): "
-            "impossibile stimare il punteggio degli allenatori."
-        )
+        return func()
+    except Exception as exc:
+        logger.warning("%s non disponibile: %s", func.__name__, exc)
+        return default
+
+
+def _ensure_unique_ids(rows):
     seen = set()
     for row in rows:
         candidate, suffix = row["id"], 2
@@ -357,3 +757,35 @@ def fetch_coaches():
         row["id"] = candidate
         seen.add(candidate)
     return rows
+
+
+def fetch_coaches():
+    """Prefer live Dunkest data; fall back to the published listone."""
+    espn = _safe_fetch(fetch_espn_records, {})
+    bbref = _safe_fetch(fetch_bballref_records, {})
+    nba = fetch_nba_records()
+    listone = _safe_fetch(fetch_dunkest_listone, [])
+
+    try:
+        live_rows = fetch_dunkest_live_coaches(espn, bbref, nba, listone)
+        if len(live_rows) >= 20:
+            return _ensure_unique_ids(live_rows)
+        logger.warning("Dunkest live: solo %s allenatori validi", len(live_rows))
+    except Exception as exc:
+        logger.warning("Dunkest live non disponibile, uso il listone: %s", exc)
+
+    if len(listone) < 20:
+        raise ValueError(
+            f"Nessuna fonte allenatori valida: live non disponibile e listone con "
+            f"{len(listone)} allenatori."
+        )
+    rows = merge_sources(listone, espn, bbref, nba)
+    rows = [row for row in rows if row["price"] > 0]
+    if len(rows) < 20:
+        raise ValueError(f"Fonti incomplete: {len(rows)} allenatori validi.")
+    if not espn and not bbref and not nba:
+        raise ValueError(
+            "Nessuna fonte di risultati raggiungibile (ESPN, Basketball-Reference, NBA.com): "
+            "impossibile stimare il punteggio degli allenatori."
+        )
+    return _ensure_unique_ids(rows)

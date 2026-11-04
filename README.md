@@ -22,20 +22,34 @@ La sincronizzazione valida il numero e i campi dei giocatori prima di salvare: s
 
 ## Budget e ottimizzazione
 
-Inserisci i crediti nel campo **Crediti disponibili** prima di generare la squadra. Il valore viene inviato all'API ad ogni calcolo. I vincoli di roster iniziali sono 10 giocatori: 2 C, 4 F e 4 G, massimo 3 membri per squadra NBA **incluso l'allenatore**; verifica che corrispondano al regolamento della modalità/giornata che stai usando.
+Inserisci i crediti nel campo **Crediti disponibili** prima di generare la squadra. Il valore viene inviato all'API ad ogni calcolo. I vincoli di roster iniziali sono 10 giocatori: 2 C, 4 F e 4 G, **massimo 2 giocatori per squadra NBA**. L'allenatore è escluso da questo limite: sono quindi validi 2 giocatori + l'allenatore della stessa squadra. Verifica che i vincoli corrispondano al regolamento della modalità/giornata che stai usando.
 
 Il motore massimizza il punteggio stimato e, a parità di punteggio, il budget utilizzato. Se la fonte non fornisce una proiezione, usa medie/forma disponibili come proxy: non è una previsione garantita.
 
 ## Allenatore
 
-In modalità Classica Dunkest si compone **10 giocatori + 1 allenatore con lo stesso budget (95 crediti)**. Il pulsante **Sincronizza allenatori** recupera e confronta più fonti pubbliche:
+In modalità Classica Dunkest si compone **10 giocatori + 1 allenatore con lo stesso budget (95 crediti)**. Il pulsante **Sincronizza allenatori** usa automaticamente i dati live Dunkest e li confronta con più fonti:
 
-- **Listone Dunkest** (foglio Google pubblicato da Dunkest): nome, squadra e crediti ufficiali dell'allenatore
+- **Dunkest live API** (`fantaking-api.dunkest.com`): quotazione corrente, giornata, avversario, media fantasy e ultime 5 partite dell'allenatore
+- **Dunkest listone** (foglio Google pubblicato da Dunkest): fallback per nome/squadra/crediti se l'API live o il token non sono disponibili
 - **ESPN** (API classifiche): vittorie/sconfitte e punti fatti/subiti
 - **Basketball-Reference**: incrocio del record e carriera dell'allenatore
 - **NBA.com** (API stats): confronto aggiuntivo, usato solo se raggiungibile (alcune reti lo bloccano; in tal caso le altre fonti restano attive)
 
-Il punteggio atteso dell'allenatore applica la tabella ufficiale Dunkest (vittoria/sconfitta con scarti, bonus/malus sui punti fatti e subiti, solo se i dati PPG sono disponibili) e il **coefficiente di difficoltà avversario** (tabella ufficiale 0,70–1,60), stimato mediando sui prezzi di tutti gli allenatori del listone perché l'avversario della giornata non è ancora noto. L'ottimizzatore sceglie **esattamente un allenatore**, conteggia i suoi crediti nel budget totale, lo somma al punteggio dei 10 giocatori e lo include nel limite di **3 membri per squadra**. La casella **Allenatore** nella sezione team permette di disattivarlo e tornare al solo roster.
+Il punteggio atteso applica la tabella ufficiale Dunkest (vittoria/sconfitta con scarti, bonus/malus sui punti fatti e subiti, solo se i dati PPG sono disponibili) e il **coefficiente di difficoltà avversario** (tabella ufficiale 0,70–1,60), calcolato sulla quotazione reale dell'allenatore avversario della giornata. La proiezione finale è **60% media live Dunkest + 40% modello regolamentare**; senza dati live resta il solo modello. L'ottimizzatore sceglie **esattamente un allenatore**, conteggia i suoi crediti nel budget totale e lo somma al punteggio dei 10 giocatori, ma **non** lo include nel limite di 2 giocatori per squadra. La casella **Allenatore** nella sezione team permette di disattivarlo e tornare al solo roster.
+
+### Token Dunkest e aggiornamento automatico
+
+Il token serve solo per scoprire gli ID degli allenatori nel listone autenticato; profilo e match-log sono pubblici. Il primo sync salva gli ID nel database, quindi i successivi funzionano anche se il token scade. Per abilitare anche il rinnovo automatico del token, aggiungi al file `.env`:
+
+```dotenv
+DUNKEST_TOKEN=...
+DUNKEST_EMAIL=tua-email
+DUNKEST_PASSWORD=tua-password
+DUNKEST_GAME_ID=1
+```
+
+Con `DUNKEST_EMAIL` e `DUNKEST_PASSWORD` impostati, se il token manca o scade il collector effettua il login e continua da solo. Senza credenziali, dopo il primo sync il live continua a funzionare tramite gli ID salvati; in caso di fallimento totale viene usato il listone statico. Il file `.env` è ignorato da Git.
 
 ## CSV
 
@@ -51,7 +65,7 @@ Il punteggio atteso dell'allenatore applica la tabella ufficiale Dunkest (vittor
 - `POST /api/coaches/sync`
 - `POST /api/optimizer/generate` con JSON `{"budget": 95, "include_coach": true}`
 
-La scansione live usa esclusivamente la tabella pubblica. Non effettua accessi autenticati all'account Dunkest e non legge dati privati.
+La scansione giocatori usa esclusivamente la tabella pubblica. La scansione allenatori usa l'API Dunkest: il token (o le credenziali opzionali) serve solo a leggere il listone della propria lega per scoprire gli ID degli allenatori; quotazioni, avversari e punteggi vengono poi letti da endpoint pubblici. Nessun dato privato viene salvato oltre a nome/squadra/quotazione pubblici degli allenatori.
 
 ## Pubblicazione online (Render, gratis)
 
@@ -70,4 +84,5 @@ Funzionamento in cloud:
 
 - I dati si aggiornano da soli all'avvio quando sono vecchi (>3h per i giocatori, >12h per gli allenatori) e con i pulsanti di sincronizzazione (massimo una richiesta ogni 5 minuti per tipo, per non disturbare i siti fonte).
 - Il free plan si spegne dopo 15 minuti di inattività: al primo accesso ci vuole circa un minuto di risveglio.
-- Il database è incluso nel repository come snapshot iniziale: se un sito fonte blocca le richiesti dalla rete del cloud (alcuni lo fanno), l'interfaccia resta comunque utilizzabile con l'ultimo listone noto.
+- Il database è incluso nel repository come snapshot iniziale: se un sito fonte blocca le richieste dalla rete del cloud (alcuni lo fanno), l'interfaccia resta comunque utilizzabile con l'ultimo listone noto.
+- Su Render il file `.env` non viene caricato: imposta `DUNKEST_TOKEN` (o `DUNKEST_EMAIL` + `DUNKEST_PASSWORD`) tra le **Environment Variables** del servizio. Lo snapshot del database include già gli ID degli allenatori correnti, quindi il live funziona anche senza token finché la lista allenatori non cambia.

@@ -19,4 +19,9 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(ROOT / ".env")
 DUNKEST_TOKEN = os.environ.get("DUNKEST_TOKEN", "")
+# Optional credentials: when the token expires, the collector can log in again
+# automatically instead of falling back to the static listone.
+DUNKEST_EMAIL = os.environ.get("DUNKEST_EMAIL", "")
+DUNKEST_PASSWORD = os.environ.get("DUNKEST_PASSWORD", "")
+DUNKEST_GAME_ID = os.environ.get("DUNKEST_GAME_ID", "1")
 

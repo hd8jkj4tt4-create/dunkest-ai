@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Dunkest AI Points Maximizer", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Dunkest AI Points Maximizer", version="0.4.0", lifespan=lifespan)
 init_db()
 app.include_router(players.router)
 app.include_router(optimizer.router)

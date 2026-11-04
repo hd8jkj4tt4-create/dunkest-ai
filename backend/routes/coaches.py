@@ -6,25 +6,30 @@ from backend.services.sync_state import run_sync, synced_at
 router = APIRouter(prefix="/api/coaches", tags=["coaches"])
 
 COLUMNS = ("id,name,team,price,wins,losses,win_pct,ppg_for,ppg_against,diff,"
-           "career_wins,career_losses,opponent_coach,record_match,projection,source")
+           "career_wins,career_losses,opponent_coach,record_match,projection,source,"
+           "dunkest_id,matchday,opponent,opponent_price,live_avg,last5,"
+           "model_projection,coefficient_win,coefficient_loss,is_injured")
 
 
 def save(rows):
+    columns = COLUMNS.split(",")
+    placeholders = ",".join("?" * len(columns))
     with connect() as con:
         # Coaches are always replaced as a whole: a partial listone would
         # otherwise keep dismissed coaches with stale prices around.
         con.execute("DELETE FROM coaches")
         for c in rows:
             con.execute(
-                f'''INSERT INTO coaches({COLUMNS},updated_at)
-                VALUES({",".join("?" * 16)},CURRENT_TIMESTAMP)''',
-                tuple(c.get(k) for k in COLUMNS.split(",")),
+                f"INSERT INTO coaches({COLUMNS},updated_at) "
+                f"VALUES({placeholders},CURRENT_TIMESTAMP)",
+                tuple(c.get(k) for k in columns),
             )
 
 
 @router.get("")
 def list_coaches(sort: str = "projection"):
-    allowed = {"projection", "price", "win_pct", "wins", "ppg_for", "name"}
+    allowed = {"projection", "price", "win_pct", "wins", "ppg_for", "name",
+               "matchday", "live_avg", "last5"}
     if sort not in allowed:
         sort = "projection"
     with connect() as con:
@@ -49,7 +54,8 @@ def sync():
         count = len(rows)
     return {
         "updated": count,
-        "sources": ["Dunkest listone", "ESPN", "Basketball-Reference", "NBA.com (opzionale)"],
+        "sources": ["Dunkest live API", "Dunkest listone (fallback)", "ESPN",
+                    "Basketball-Reference", "NBA.com (opzionale)"],
         "synced_at": synced_at("coaches"),
         "cached": cached,
     }
